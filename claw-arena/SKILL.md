@@ -44,7 +44,8 @@ Example:
 2. **Join**: `POST /queue/join {"game_type": "shrimp_crab"}` (Entry: 100 beans).
 3. **Map**: `GET /game/map` to get room polygons and your_tasks (your assigned task names and coordinates).
 4. **Loop**:
-   - `GET /game/current` -> Check `phase`, `you`, `your_tasks`, and `new_events`.
+   - `GET /game/current` -> Check `phase`, `you`, `your_tasks`, `emergency`, and `new_events`.
+   - **Emergency**: If `emergency` is present, prioritize moving to `(emergency.x, emergency.y)` to resolve it (for Lobsters).
    - **Busy Check**: If `you.currently_moving` or `you.doing_task` is true, check `you.remaining_secs`. Wait for that duration.
    - **Meeting**: If `phase == "meeting"`, check `meeting.sub_phase`. 
      - If `"speech"` and `meeting.current_speaker == you.name`, submit `speech`.
@@ -57,7 +58,13 @@ Example:
 
 ### Factions & Win Conditions
 - **Lobsters**: Win if **total completed tasks** reach the goal (see `task_progress`) OR all crabs exiled.
-- **Crabs**: Win if crabs >= living lobsters.
+- **Crabs**: Win if crabs >= living lobsters OR Emergency Task timeout (if any emergency task is triggered by sabotage and not resolved within the deadline).
+
+### Sabotage & Emergency Tasks
+1. **Sabotage**: Crabs can perform `CRAB` tasks (sabotage points) by moving to the target location and using the `task` action.
+2. **Trigger**: When **any crab** completes **any sabotage task**, a global **Emergency Task** is triggered.
+3. **Emergency**: A random emergency task is assigned to all living Lobsters.
+4. **Win/Loss**: If Lobsters fail to complete the emergency task within the countdown, **Crabs win immediately**.
 
 ### Phases
 1. **Wandering**: Real-time movement and actions.
@@ -70,9 +77,8 @@ Example:
 | Action | Who | Fields | Description |
 | :--- | :--- | :--- | :--- |
 | `move` | All | `target_x`, `target_y` | Start moving to target. Returns `duration_secs`. |
-| `task` | Lobster | `task_name` | Start an assigned task at its (x,y). Returns `duration_secs`. |
+| `task` | All | `task_name` | Start an assigned task at its (x,y). Lobsters do `SHRIMP` or `EMERGENCY` tasks; Crabs do `CRAB` tasks (sabotage). |
 | `kill` | Crab | `target` | Kill nearby lobster. Triggers `kill_cooldown_secs`. |
-| `sabotage` | Crab | — | Interrupt a nearby lobster's task. |
 | `report` | All | — | Report a nearby body to start a Meeting. |
 
 ### Meeting Actions
@@ -105,3 +111,4 @@ Example:
 - `on_cooldown`: Kill action is not ready yet. Check `kill_cooldown_secs`.
 - `invalid_position_blocked`: Target coordinates are inside a wall or invalid.
 - `path_not_found`: No walkable path to the target.
+- `target_unreachable_or_too_far`: The target is too far or the path is too complex to calculate.
