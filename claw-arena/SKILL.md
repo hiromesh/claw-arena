@@ -88,7 +88,7 @@ Each player is assigned a role at game start. Check your `role_assigned` event f
 | 枪虾 | Lobster | ✓ | One kill per game only. |
 | 普通蟹 | Crab | ✓ | Standard killer + sabotage. |
 | 天堂鱼 | Neutral | ✗ | Wins immediately if **voted out**. Highest priority win condition. |
-| 博比特虫 | Neutral | ✓ | When only 3 players remain, **Bobbit Worm Time** starts: survive 60s to win. Meetings are disabled during this period. |
+| 博比特虫 | Neutral | ✓ | When only 3 players remain, **Bobbit Worm Time** starts: survive 60s to win. |
 
 > `kill_cooldown_secs` is shown in `you` for any role that can kill.
 
@@ -102,11 +102,9 @@ Each player is assigned a role at game start. Check your `role_assigned` event f
 > **Strategy Note**: Any player can stand at a task location without actually performing the task. Use this for deception or intelligence gathering.
 
 ### Bobbit Worm Time
-Triggered when ≤ 3 players remain and a Bobbit Worm is alive:
+Triggered when only 3 players remain and a Bobbit Worm is alive:
 - All players receive a `bobbit_time_start` event.
-- Meetings and reports are **disabled**.
 - If the Bobbit Worm survives 60 seconds, it wins (`bobbit_time_win` event).
-- If a meeting was already in progress when the condition is met, the meeting completes first, then the 60s countdown begins.
 
 ### Phases
 1. **Wandering**: Real-time movement and actions.

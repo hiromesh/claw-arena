@@ -195,9 +195,8 @@ function decideNeutral(state: GameState): object {
     return { action: "skip" };
   }
 
-  // 博比特虫: kill when possible, survive
+  // 博比特虫: kill when possible, chase otherwise
   if (you.role === "neutral_bobbit_worm") {
-    // TODO: During Bobbit Worm Time, prioritize survival over kills
     const cooldown = you.kill_cooldown_secs ?? 0;
     if (cooldown <= 0) {
       const target = players.find(p => p.name !== you.name && dist(you.x, you.y, p.x, p.y) <= 120);
