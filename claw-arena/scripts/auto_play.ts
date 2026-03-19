@@ -19,6 +19,8 @@
 import * as fs from "fs";
 import * as path from "path";
 import WebSocket from "ws";
+import * as https from "https";
+import * as http from "http";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -85,7 +87,7 @@ interface You {
   kill_cooldown_secs?: number;
 }
 
-interface TaskInfo  { name: string; x: number; y: number; room: string; }
+interface TaskInfo  { name: string; x: number; y: number; room: string; status?: string; }
 interface PlayerInfo { name: string; x: number; y: number; room: string; }
 interface CorpseInfo { name: string; x: number; y: number; room: string; }
 
@@ -215,18 +217,43 @@ class Bot {
   private ws!: WebSocket;
   private log: Logger;
   private state: GameState | null = null;
+  private cachedTasks: TaskInfo[] = [];
   private meetingActive = false;
   private gameOver = false;
   private wsUrl: string;
+  private httpBaseUrl: string;
 
   constructor(private apiKey: string, logFile: string, baseUrl: string) {
     this.log = new Logger(logFile);
     this.wsUrl = `${baseUrl}/api/v1/game/stream?api_key=${apiKey}`;
+    this.httpBaseUrl = baseUrl.replace(/^wss?:\/\//, "http://").replace(/^ws:\/\//, "http://");
   }
 
   start() {
     this.log.status("connecting", `Connecting to ${this.wsUrl}`);
     this.connect();
+  }
+
+  private fetchMapInfo(): Promise<void> {
+    return new Promise((resolve) => {
+      const url = `${this.httpBaseUrl}/api/v1/game/map`;
+      const lib = url.startsWith("https") ? https : http;
+      const req = lib.get(url, { headers: { Authorization: `Bearer ${this.apiKey}` } }, (res) => {
+        let body = "";
+        res.on("data", (chunk: Buffer) => body += chunk.toString());
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(body);
+            if (json.success && json.data?.your_tasks) {
+              this.cachedTasks = json.data.your_tasks;
+              this.log.status("tasks_loaded", `Loaded ${this.cachedTasks.length} tasks from /game/map`);
+            }
+          } catch { /* ignore */ }
+          resolve();
+        });
+      });
+      req.on("error", () => resolve());
+    });
   }
 
   private connect() {
@@ -237,7 +264,7 @@ class Bot {
       setInterval(() => {
         if (this.ws.readyState === WebSocket.OPEN) this.ws.send("ping");
       }, HEARTBEAT_INTERVAL_MS);
-      this.scheduleDecision();
+      this.fetchMapInfo().then(() => this.scheduleDecision());
     });
 
     this.ws.on("message", (raw: WebSocket.RawData) => {
@@ -263,7 +290,22 @@ class Bot {
   private onMessage(msg: { type: string; [k: string]: unknown }) {
     // Full state snapshot
     if (msg.type === "state") {
-      this.state = msg.data as GameState;
+      const data = msg.data as any;
+      const taskStatusMap: Record<string, string> = {};
+      if (Array.isArray(data.your_tasks)) {
+        for (const t of data.your_tasks) taskStatusMap[t.name] = t.status;
+      }
+      const mergedTasks = this.cachedTasks.map(t => ({
+        ...t,
+        status: taskStatusMap[t.name] ?? t.status ?? "normal",
+      })).filter(t => t.status !== "completed");
+
+      this.state = {
+        ...data,
+        players: data.players ?? data.visible_players ?? [],
+        corpses: data.corpses ?? data.nearby_corpses ?? [],
+        your_tasks: mergedTasks,
+      } as GameState;
       this.syncPhase(this.state.phase);
       return;
     }
@@ -294,7 +336,9 @@ class Bot {
         this.meetingActive = false;
         this.log.status("meeting_ended", "Meeting ended. Bot resuming.");
         break;
-      case "role_assigned":
+      case "task_completed":
+        this.cachedTasks = this.cachedTasks.filter(t => t.name !== evt.task_name);
+        break;
         this.log.status("role_assigned",
           `Role: ${evt.role_display_name} (${evt.faction}). Goal: ${evt.role_target ?? "?"}`);
         break;
