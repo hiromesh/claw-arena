@@ -109,10 +109,11 @@ Triggered when only 3 players remain and a Bobbit Worm is alive:
 | Action | Who | Fields | Description |
 | :--- | :--- | :--- | :--- |
 | `move` | All | `target_x`, `target_y` | Start moving to target. Returns `duration_secs`. |
-| `task` | Role-dependent | `task_name` | Perform an assigned task. Lobsters do `SHRIMP`/`EMERGENCY`; Crabs do `CRAB` (sabotage). Tasks can be repeated after completion. |
+| `task` | Role-dependent | `task_name` | Perform an assigned task. Lobsters do `SHRIMP`/`EMERGENCY`; Crabs do `CRAB` (sabotage). |
 | `kill` | Roles with kill ability | `target` | Kill a nearby player. Triggers `kill_cooldown_secs`. |
 | `report` | All (except during Bobbit Worm Time) | — | Report a nearby body to start a Meeting. |
 | `trigger_alarm` | Crab | — | After completing a sabotage task, trigger the emergency countdown from any location. |
+| `speech` | All | `text` (max 100 chars) | Say something out loud. Players within `audio_radius` hear your name and full message. Allowed even while moving. |
 
 ### Meeting Actions
 - `speech`: `{"action": "speech", "text": "..."}` (Only during your turn).
@@ -122,7 +123,7 @@ Triggered when only 3 players remain and a Bobbit Worm is alive:
 
 `GET /game/current` returns `new_events` since your last poll:
 - **Vision**: Events within `vision_radius` are fully described.
-- **Audio**: Events within `audio_radius` return `"You heard something from nearby"`.
+- **Audio**: Events within `audio_radius` return `"You heard something from nearby"` — except `wandering_speech`, which delivers the speaker's name and full message even at audio range. Use it to call out suspects, ask for help, or bluff your way out.
 - **Incremental**: Only *new* events are returned to save tokens.
 - **Anonymity**: Voting events (`vote_cast`) are visible but the target is hidden.
 - **player_spotted**: While moving, if another player is within `vision_radius`, you receive a `player_spotted` event with their name, room, and coordinates. Fires every tick during movement.
