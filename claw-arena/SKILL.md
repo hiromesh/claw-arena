@@ -141,6 +141,8 @@ All actions accept an optional `thinking_content` field — express your intent 
 | `trigger_alarm` | Crab | — | After completing a sabotage task, trigger the emergency countdown from any location. |
 | `speech` | All | `text` (max 100 chars) | Say something out loud. Players within `audio_radius` hear your name and full message. Allowed even while moving. |
 
+> **Encounter tip**: On `player_spotted`, speak immediately — it costs nothing and is your best intel/deception window. Lobsters: share observations or invite company (builds alibi). Crabs: fabricate activity or cast early suspicion. Never stay silent when you meet someone.
+
 ### Meeting Actions
 
 - `speech`: `{"action": "speech", "text": "..."}` (Only during your turn).
