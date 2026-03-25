@@ -1,17 +1,21 @@
 /**
  * auto_play.ts — ClawArena Shrimp-Crab Kill auto-play bot via WebSocket.
  *
+ * Architecture:
+ *   - WebSocket: send actions (move/task/kill/report/trigger_alarm), receive events
+ *   - HTTP GET /game/current: poll authoritative state each decision cycle
+ *   - HTTP GET /game/map: load map rooms & refresh task list
+ *   - Behavior Tree: decide next action based on polled state
+ *
+ * Decision loop:
+ *   1. Poll GET /game/current for fresh state
+ *   2. If busy (currently_moving / doing_task) → wait remaining_secs, goto 1
+ *   3. Update memory from visible_players, corpses, new_events
+ *   4. Tick behavior tree → get pendingAction
+ *   5. Send action via WebSocket → wait debounce (500ms) → goto 1
+ *
  * Usage:
- *   npx ts-node auto_play.ts --api-key arena_xxx --log-file /tmp/game.log [--base-url wss://...]
- *
- * Log file format (JSONL, one JSON object per line):
- *   {"ts":1234,"type":"event",  "data":{...}}              — raw server event
- *   {"ts":1234,"type":"action", "action":"move","payload":{...}} — action sent by bot
- *   {"ts":1234,"type":"status", "status":"meeting_started","message":"..."} — bot state change
- *   {"ts":1234,"type":"error",  "message":"..."}           — errors
- *
- * When phase == "meeting", the bot pauses and writes a "meeting_started" status line.
- * The agent should then handle speech/vote via HTTP and optionally kill this process.
+ *   npx ts-node auto_play.ts --api-key arena_xxx --log-file game.log [--base-url wss://...]
  */
 
 /// <reference types="node" />
@@ -22,11 +26,18 @@ import WebSocket from "ws";
 import * as https from "https";
 import * as http from "http";
 
+import { GameState, TaskInfo, RoomCenter, Memory, Blackboard, BtNode, createBlackboard } from "./bt/framework";
+import { createTree } from "./bt/trees";
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const DECISION_INTERVAL_MS = 2500; // ms between decision cycles
 const HEARTBEAT_INTERVAL_MS = 15000;
 const RECONNECT_DELAY_MS = 3000;
+const TASK_REFRESH_INTERVAL_MS = 5000;
+const POST_ACTION_DEBOUNCE_MS = 500;    // wait after sending action before next poll
+const MIN_POLL_INTERVAL_MS = 500;       // never poll faster than this
+const IDLE_POLL_INTERVAL_MS = 1000;     // poll interval when idle (no action to take)
+const STUCK_TIMEOUT_MS = 20000;         // force wander if position unchanged for this long
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -65,150 +76,8 @@ class Logger {
 
   event(data: object)                          { this.write({ type: "event", data }); }
   action(action: string, payload: object)      { this.write({ type: "action", action, payload }); }
-  status(status: string, message: string, extra?: object) {
-    this.write({ type: "status", status, message, ...extra });
-  }
+  status(status: string, message: string)      { this.write({ type: "status", status, message }); }
   error(message: string)                       { this.write({ type: "error", message }); }
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface You {
-  name: string;
-  role: string;
-  faction: string;       // "lobster" | "crab" | "neutral"
-  is_alive: boolean;
-  x: number;
-  y: number;
-  room: string;
-  currently_moving: boolean;
-  doing_task: boolean;
-  remaining_secs: number;
-  kill_cooldown_secs?: number;
-}
-
-interface TaskInfo  { name: string; x: number; y: number; room: string; status?: string; }
-interface PlayerInfo { name: string; x: number; y: number; room: string; }
-interface CorpseInfo { name: string; x: number; y: number; room: string; }
-
-interface GameState {
-  phase: string;
-  you: You;
-  your_tasks: TaskInfo[];
-  players: PlayerInfo[];
-  corpses: CorpseInfo[];
-  emergency?: TaskInfo & { remaining_secs: number };
-  task_progress?: { completed: number; goal: number };
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function dist(ax: number, ay: number, bx: number, by: number) {
-  return Math.sqrt((bx - ax) ** 2 + (by - ay) ** 2);
-}
-
-function nearest<T extends { x: number; y: number }>(from: You, items: T[]): T | null {
-  if (!items.length) return null;
-  return items.reduce((a, b) =>
-    dist(from.x, from.y, a.x, a.y) <= dist(from.x, from.y, b.x, b.y) ? a : b
-  );
-}
-
-// ─── Decision logic ───────────────────────────────────────────────────────────
-
-/**
- * Decide next action for Lobster faction.
- * TODO: Improve task prioritization (e.g. prefer tasks in safe rooms).
- * TODO: Add logic to avoid known crab locations.
- * TODO: Consider not reporting if you suspect you'll be voted out.
- */
-function decideLobster(state: GameState): object {
-  const { you, your_tasks, corpses, emergency } = state;
-
-  // TODO: Handle emergency with higher urgency (e.g. sprint)
-  if (emergency) {
-    if (dist(you.x, you.y, emergency.x, emergency.y) > 20)
-      return { action: "move", target_x: emergency.x, target_y: emergency.y };
-    return { action: "task", task_name: emergency.name };
-  }
-
-  // TODO: Decide whether to report based on game situation
-  const nearCorpse = corpses.find(c => dist(you.x, you.y, c.x, c.y) <= 100);
-  if (nearCorpse) return { action: "report" };
-
-  // TODO: Prioritize tasks strategically
-  const task = nearest(you, your_tasks);
-  if (task) {
-    if (dist(you.x, you.y, task.x, task.y) > 20)
-      return { action: "move", target_x: task.x, target_y: task.y };
-    return { action: "task", task_name: task.name };
-  }
-
-  return { action: "skip" };
-}
-
-/**
- * Decide next action for Crab faction.
- * TODO: Choose kill targets more strategically (e.g. isolated lobsters).
- * TODO: Move away from sabotage site before triggering alarm.
- * TODO: Coordinate with crab teammates if possible.
- */
-function decideCrab(state: GameState): object {
-  const { you, your_tasks, players } = state;
-  const cooldown = you.kill_cooldown_secs ?? 0;
-
-  // TODO: Pick best target (e.g. lowest task progress, most isolated)
-  if (cooldown <= 0) {
-    const target = players.find(p => p.name !== you.name && dist(you.x, you.y, p.x, p.y) <= 120);
-    if (target) return { action: "kill", target: target.name };
-  }
-
-  // TODO: Trigger alarm from a safe location after sabotage
-  const task = nearest(you, your_tasks);
-  if (task) {
-    if (dist(you.x, you.y, task.x, task.y) > 20)
-      return { action: "move", target_x: task.x, target_y: task.y };
-    return { action: "task", task_name: task.name };
-  }
-
-  // Chase nearest player when no tasks left
-  const target = players.find(p => p.name !== you.name);
-  if (target) return { action: "move", target_x: target.x, target_y: target.y };
-
-  return { action: "skip" };
-}
-
-/**
- * Decide next action for Neutral faction.
- * TODO: 天堂鱼 — be more actively suspicious to attract votes.
- * TODO: 博比特虫 — survive strategically during Bobbit Worm Time.
- */
-function decideNeutral(state: GameState): object {
-  const { you, players, corpses } = state;
-
-  // 天堂鱼: wants to be voted out — act suspicious, stay visible
-  if (you.role === "neutral_paradise_fish") {
-    // TODO: Stand near bodies, move toward groups, act erratically
-    const nearCorpse = corpses.find(c => dist(you.x, you.y, c.x, c.y) <= 100);
-    if (nearCorpse) return { action: "report" };
-    const target = players.find(p => p.name !== you.name);
-    if (target && dist(you.x, you.y, target.x, target.y) > 50)
-      return { action: "move", target_x: target.x, target_y: target.y };
-    return { action: "skip" };
-  }
-
-  // 博比特虫: kill when possible, chase otherwise
-  if (you.role === "neutral_bobbit_worm") {
-    const cooldown = you.kill_cooldown_secs ?? 0;
-    if (cooldown <= 0) {
-      const target = players.find(p => p.name !== you.name && dist(you.x, you.y, p.x, p.y) <= 120);
-      if (target) return { action: "kill", target: target.name };
-    }
-    const target = players.find(p => p.name !== you.name);
-    if (target) return { action: "move", target_x: target.x, target_y: target.y };
-  }
-
-  return { action: "skip" };
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -216,17 +85,74 @@ function decideNeutral(state: GameState): object {
 class Bot {
   private ws!: WebSocket;
   private log: Logger;
-  private state: GameState | null = null;
-  private cachedTasks: TaskInfo[] = [];
-  private meetingActive = false;
-  private gameOver = false;
   private wsUrl: string;
   private httpBaseUrl: string;
+
+  // ─── Game state ───
+  private gameOver = false;
+  private meetingActive = false;
+
+  // ─── Map & tasks ───
+  private mapRooms: RoomCenter[] = [];
+  private cachedTasks: TaskInfo[] = [];
+  private completedTaskNames: Set<string> = new Set();
+  private lastAttemptedTask: string | null = null;
+  private lastTaskRefreshTs = 0;
+  /** Track last processed event tick from WebSocket state messages to deduplicate. */
+  private lastWsStateTick = -1;
+  private isRefreshing = false;
+  /** All task locations on the map (for idle player detection). */
+  private allTaskLocations: { x: number; y: number }[] = [];
+
+  // ─── Memory ───
+  private memory: Memory = {
+    playerSightings: new Map(),
+    corpseSightings: new Map(),
+    encounters: new Map(),
+    socializing: null,
+    corpseDecisions: new Map(),
+    teammates: new Set(),
+    lastPlayerSeenTs: Date.now(),
+    canTriggerAlarm: false,
+    assignedTaskNames: new Set(),
+    playerIdleCount: new Map(),
+    stalking: null,
+    hasUsedOneTimeKill: false,
+    lastKillTick: -Infinity,
+    sabotageRoom: null,
+    hunting: null,
+    lastAlarmTick: -Infinity,
+    loitering: null,
+  };
+
+  // ─── Behavior tree ───
+  private tree: BtNode | null = null;
+  private blackboard: Blackboard | null = null;
+
+  // ─── Timing ───
+  private lastActionTs = 0;
+  /** Set by WebSocket action_result errors (task_already_in_progress, on_cooldown, etc.)
+   *  as a fallback busy signal when HTTP poll state is stale. */
+  private errorBusyUntil = 0;
+  /** Dedup: JSON of last sent action + timestamp to avoid spamming the same action. */
+  private lastSentAction = "";
+  private lastSentTs = 0;
+  /** When true, next decide() will call fetchMapInfo() to sync tasks from server. */
+  private needsTaskRefresh = false;
+  /** Last known room of this bot (for sabotageRoom tracking). */
+  private lastRoom: string = "";
+  /** Anti-stuck: last recorded position and the timestamp it was last updated. */
+  private lastKnownPos: { x: number; y: number } | null = null;
+  private lastPosMoveTs: number = Date.now();
+  /** Track socializing state changes to emit social_start / social_end log events. */
+  private lastSocialTarget: string | null = null;
+  /** Recent player_spotted cache: name → {x, y, room, tick}. Merged into bb.state.players each decide(). */
+  private recentSpotted: Map<string, { x: number; y: number; room: string; tick: number }> = new Map();
 
   constructor(private apiKey: string, logFile: string, baseUrl: string) {
     this.log = new Logger(logFile);
     this.wsUrl = `${baseUrl}/api/v1/game/stream?api_key=${apiKey}`;
-    this.httpBaseUrl = baseUrl.replace(/^wss?:\/\//, "http://").replace(/^ws:\/\//, "http://");
+    this.httpBaseUrl = baseUrl.replace(/^wss?:\/\//, "https://").replace(/^ws:\/\//, "http://");
   }
 
   start() {
@@ -234,27 +160,219 @@ class Bot {
     this.connect();
   }
 
-  private fetchMapInfo(): Promise<void> {
+  // ─── HTTP ──────────────────────────────────────────────────────────────────
+
+  private httpGet(urlPath: string): Promise<any> {
     return new Promise((resolve) => {
-      const url = `${this.httpBaseUrl}/api/v1/game/map`;
+      const url = `${this.httpBaseUrl}${urlPath}`;
       const lib = url.startsWith("https") ? https : http;
       const req = lib.get(url, { headers: { Authorization: `Bearer ${this.apiKey}` } }, (res) => {
         let body = "";
         res.on("data", (chunk: Buffer) => body += chunk.toString());
         res.on("end", () => {
-          try {
-            const json = JSON.parse(body);
-            if (json.success && json.data?.your_tasks) {
-              this.cachedTasks = json.data.your_tasks;
-              this.log.status("tasks_loaded", `Loaded ${this.cachedTasks.length} tasks from /game/map`);
-            }
-          } catch { /* ignore */ }
-          resolve();
+          try { resolve(JSON.parse(body)); }
+          catch { resolve(null); }
         });
       });
-      req.on("error", () => resolve());
+      req.on("error", () => resolve(null));
     });
   }
+
+  // ─── Map & Task management ─────────────────────────────────────────────────
+
+  private async fetchMapInfo(): Promise<void> {
+    const json = await this.httpGet("/api/v1/game/map");
+    if (!json?.success || !json.data) return;
+
+    // Load walkable room targets (once)
+    if (this.mapRooms.length === 0 && Array.isArray(json.data.rooms)) {
+      for (const r of json.data.rooms) {
+        const locs = r.task_locations;
+        if (locs && typeof locs === "object") {
+          const keys = Object.keys(locs);
+          if (keys.length > 0) {
+            const coord = locs[keys[0]];
+            if (Array.isArray(coord) && coord.length === 2) {
+              this.mapRooms.push({ id: r.id, x: coord[0], y: coord[1] });
+            }
+          }
+        }
+      }
+      this.log.status("map_loaded", `Loaded ${this.mapRooms.length} walkable room targets`);
+    }
+
+    // Load all task locations (for idle player detection)
+    if (this.allTaskLocations.length === 0) {
+      // Try all_task_locations first
+      if (Array.isArray(json.data.all_task_locations) && json.data.all_task_locations.length > 0) {
+        for (const loc of json.data.all_task_locations) {
+          if (loc.x != null && loc.y != null) {
+            this.allTaskLocations.push({ x: loc.x, y: loc.y });
+          }
+        }
+      }
+      // Fallback: extract from rooms' task_locations
+      if (this.allTaskLocations.length === 0 && Array.isArray(json.data.rooms)) {
+        for (const r of json.data.rooms) {
+          const locs = r.task_locations;
+          if (locs && typeof locs === "object") {
+            for (const key of Object.keys(locs)) {
+              const coord = locs[key];
+              if (Array.isArray(coord) && coord.length === 2) {
+                this.allTaskLocations.push({ x: coord[0], y: coord[1] });
+              }
+            }
+          }
+        }
+      }
+      if (this.allTaskLocations.length > 0) {
+        this.log.status("task_locations_loaded", `Loaded ${this.allTaskLocations.length} task locations for idle detection`);
+      }
+    }
+
+    // Sync tasks with server (authoritative)
+    if (Array.isArray(json.data.your_tasks)) {
+      this.syncTasks(json.data.your_tasks);
+    }
+    this.lastTaskRefreshTs = Date.now();
+  }
+
+  /** Sync cached tasks with authoritative server list from /game/map.
+   *  Tasks missing from server list are treated as completed and removed. */
+  private syncTasks(serverTasks: TaskInfo[]) {
+    const serverActive = serverTasks.filter(t => t.status !== "completed");
+    const serverNames = new Set(serverActive.map(t => t.name));
+
+    // Detect removed tasks (completed on server but still in cache)
+    const removedTasks = this.cachedTasks.filter(t => !serverNames.has(t.name));
+    for (const t of removedTasks) {
+      this.completedTaskNames.add(t.name);
+      if (this.memory.assignedTaskNames.has(t.name)) {
+        this.memory.canTriggerAlarm = true;
+      }
+    }
+    if (removedTasks.length > 0) {
+      this.lastSentAction = "";
+    }
+
+    // Replace cache with server truth
+    this.cachedTasks = serverActive.map(t => ({
+      name: t.name, x: t.x, y: t.y, room: t.room, status: t.status ?? "normal"
+    }));
+
+    this.log.status("tasks_synced", `Synced: ${this.cachedTasks.length} active, ${removedTasks.length} removed`);
+  }
+
+  /** Add any new tasks from server into cachedTasks (additive only, used by /game/current). */
+  private mergeNewTasks(serverTasks: TaskInfo[]) {
+    let added = 0;
+    for (const t of serverTasks) {
+      if (t.status === "completed") continue;
+      if (!this.cachedTasks.find(ct => ct.name === t.name)) {
+        this.cachedTasks.push({ name: t.name, x: t.x, y: t.y, room: t.room, status: t.status ?? "normal" });
+        added++;
+      }
+    }
+    if (added > 0) {
+      this.log.status("tasks_refreshed", `Added ${added} new task(s), total: ${this.cachedTasks.length}`);
+    }
+  }
+
+  /** Mark a task as completed and remove from cache. */
+  private markTaskCompleted(taskName: string) {
+    this.completedTaskNames.add(taskName);
+    this.cachedTasks = this.cachedTasks.filter(t => t.name !== taskName);
+  }
+
+  /** Poll /game/map when no cached tasks remain (fallback refresh). */
+  private async maybeRefreshTasks(): Promise<void> {
+    // All tasks done once — clear completed marks to allow repeating for task_progress
+    if (this.getActiveTasks().length === 0 && this.cachedTasks.length > 0) {
+      this.completedTaskNames.clear();
+      return;
+    }
+    if (this.cachedTasks.length > 0) return;
+    if (this.isRefreshing) return;
+    if (Date.now() - this.lastTaskRefreshTs < TASK_REFRESH_INTERVAL_MS) return;
+    this.isRefreshing = true;
+    await this.fetchMapInfo();
+    this.isRefreshing = false;
+  }
+
+  /** Build the active task list (excluding completed tasks). */
+  private getActiveTasks(): TaskInfo[] {
+    return this.cachedTasks.filter(t => !this.completedTaskNames.has(t.name));
+  }
+
+  // ─── Memory ────────────────────────────────────────────────────────────────
+
+  /** Record a player sighting into memory (dedup by name+tick). */
+  private recordPlayerSighting(name: string, x: number, y: number, room: string, tick: number) {
+    const records = this.memory.playerSightings.get(name) ?? [];
+    // Dedup: skip if same player same tick
+    if (records.length > 0 && records[records.length - 1].tick === tick) return;
+    records.push({ x, y, room, tick });
+    if (records.length > 5) records.shift();
+    this.memory.playerSightings.set(name, records);
+  }
+
+  /** Record a corpse discovery into memory (only first time). */
+  private recordCorpse(name: string, x: number, y: number, room: string, tick: number) {
+    if (this.memory.corpseSightings.has(name)) return;
+    this.memory.corpseSightings.set(name, { x: x ?? 0, y: y ?? 0, room: room ?? "unknown", tick });
+    this.log.status("corpse_discovered", `Discovered corpse of ${name} in ${room ?? "unknown"}`);
+  }
+
+  /** Update memory from polled state (visible_players, corpses, new_events). */
+  private updateMemory(data: any, tick: number) {
+    const myName = data.you?.name;
+
+    // Visible players
+    const players = data.players ?? data.visible_players ?? [];
+    for (const p of players) {
+      if (p.name !== myName) {
+        this.recordPlayerSighting(p.name, p.x, p.y, p.room, tick);
+
+        // Idle player detection: check if player is near any task location
+        if (this.allTaskLocations.length > 0) {
+          const nearTask = this.allTaskLocations.some(
+            loc => Math.sqrt((loc.x - p.x) ** 2 + (loc.y - p.y) ** 2) <= 50
+          );
+          if (nearTask) {
+            this.memory.playerIdleCount.set(p.name, 0);
+          } else {
+            const prev = this.memory.playerIdleCount.get(p.name) ?? 0;
+            this.memory.playerIdleCount.set(p.name, prev + 1);
+          }
+        }
+      }
+    }
+    if (players.some((p: any) => p.name !== myName)) {
+      this.memory.lastPlayerSeenTs = Date.now();
+    }
+
+    // Nearby corpses
+    const corpses = data.corpses ?? data.nearby_corpses ?? [];
+    for (const c of corpses) {
+      this.recordCorpse(c.name, c.x, c.y, c.room, tick);
+    }
+
+    // Clean up corpse decision cache for corpses no longer in view
+    for (const name of this.memory.corpseDecisions.keys()) {
+      if (!corpses.find((c: any) => c.name === name)) {
+        this.memory.corpseDecisions.delete(name);
+      }
+    }
+
+    // Process new_events for additional info
+    if (Array.isArray(data.new_events)) {
+      for (const evt of data.new_events) {
+        this.onEvent(evt);
+      }
+    }
+  }
+
+  // ─── WebSocket ─────────────────────────────────────────────────────────────
 
   private connect() {
     this.ws = new WebSocket(this.wsUrl);
@@ -264,7 +382,7 @@ class Bot {
       setInterval(() => {
         if (this.ws.readyState === WebSocket.OPEN) this.ws.send("ping");
       }, HEARTBEAT_INTERVAL_MS);
-      this.fetchMapInfo().then(() => this.scheduleDecision());
+      this.fetchMapInfo().then(() => this.scheduleDecision(0));
     });
 
     this.ws.on("message", (raw: WebSocket.RawData) => {
@@ -272,7 +390,7 @@ class Bot {
       if (text === "pong") return;
       try {
         const msg = JSON.parse(text);
-        this.onMessage(msg);
+        this.onWsMessage(msg);
       } catch {
         this.log.error(`Invalid JSON: ${text}`);
       }
@@ -287,30 +405,26 @@ class Bot {
     this.ws.on("error", (err: Error) => this.log.error(`WS error: ${err.message}`));
   }
 
-  private onMessage(msg: { type: string; [k: string]: unknown }) {
-    // Full state snapshot
+  /** Handle WebSocket messages — only for events and logging. State comes from HTTP poll. */
+  private onWsMessage(msg: { type: string; [k: string]: unknown }) {
+    // Extract new_events from state snapshots (cumulative, needs dedup by tick)
     if (msg.type === "state") {
       const data = msg.data as any;
-      const taskStatusMap: Record<string, string> = {};
-      if (Array.isArray(data.your_tasks)) {
-        for (const t of data.your_tasks) taskStatusMap[t.name] = t.status;
+      if (data?.new_events?.length) {
+        const threshold = this.lastWsStateTick;
+        let maxTick = threshold;
+        for (const evt of data.new_events) {
+          const evtTick = (evt as any).tick ?? -1;
+          if (evtTick <= threshold) continue;
+          if (evtTick > maxTick) maxTick = evtTick;
+          this.log.event(evt);
+          this.onEvent(evt);
+        }
+        this.lastWsStateTick = maxTick;
       }
-      const mergedTasks = this.cachedTasks.map(t => ({
-        ...t,
-        status: taskStatusMap[t.name] ?? t.status ?? "normal",
-      })).filter(t => t.status !== "completed");
-
-      this.state = {
-        ...data,
-        players: data.players ?? data.visible_players ?? [],
-        corpses: data.corpses ?? data.nearby_corpses ?? [],
-        your_tasks: mergedTasks,
-      } as GameState;
-      this.syncPhase(this.state.phase);
       return;
     }
 
-    // Event or event batch — log everything
     const events: { type: string; [k: string]: unknown }[] =
       msg.type === "event_batch" ? (msg.data as typeof events) : [msg];
 
@@ -320,6 +434,8 @@ class Bot {
     }
   }
 
+  // ─── Event handling ────────────────────────────────────────────────────────
+
   private onEvent(evt: { type: string; [k: string]: unknown }) {
     switch (evt.type) {
       case "game_over":
@@ -327,27 +443,146 @@ class Bot {
         this.log.status("game_over", `Winner: ${evt.winner} — ${evt.reason}`);
         process.exit(0);
         break;
+
       case "meeting_start":
         this.meetingActive = true;
-        this.log.status("meeting_started",
-          "Meeting in progress. Bot paused. Handle speech/vote via HTTP API.");
+        this.memory.socializing = null;
+        this.log.status("meeting_started", "Meeting in progress. Handle speech/vote via HTTP.");
         break;
+
       case "meeting_ended":
         this.meetingActive = false;
         this.log.status("meeting_ended", "Meeting ended. Bot resuming.");
         break;
+
       case "task_completed":
-        this.cachedTasks = this.cachedTasks.filter(t => t.name !== evt.task_name);
+        this.markTaskCompleted(evt.task_name as string);
+        this.lastSentAction = "";
+        if (this.memory.assignedTaskNames.has(evt.task_name as string)) {
+          this.memory.canTriggerAlarm = true;
+          this.memory.sabotageRoom = this.lastRoom || null;
+        }
         break;
+
+      case "task_sabotaged":
+        this.markTaskCompleted(evt.task_name as string);
+        this.lastSentAction = "";
+        this.memory.canTriggerAlarm = true;
+        this.memory.sabotageRoom = this.lastRoom || null;
+        break;
+
+      case "emergency_resolved":
+        this.markTaskCompleted(evt.task_name as string);
+        this.lastSentAction = "";
+        break;
+
+      case "action_result": {
+        const error = (evt as any).error ?? (evt as any).data?.error;
+        // On success: clear dedup when arrived (distance=0) or task done
+        if (!error) {
+          const d = (evt as any).data ?? {};
+          const distance = d.distance ?? d.data?.distance;
+          if (distance === 0 || distance === undefined) {
+            this.lastSentAction = "";
+          }
+        }
+        if (error === "task_already_completed" || error === "task_not_assigned_to_you") {
+          if (this.lastAttemptedTask) this.markTaskCompleted(this.lastAttemptedTask);
+          this.lastSentAction = "";
+          this.needsTaskRefresh = true;
+        }
+        // Server says we're still busy — set a fallback wait and request task refresh
+        if (error === "task_already_in_progress" || error === "doing_task"
+         || error === "currently_moving") {
+          const remaining = (evt as any).remaining_secs ?? (evt as any).data?.remaining_secs;
+          this.errorBusyUntil = Date.now() + (remaining ? remaining * 1000 : 2000);
+          if (error === "task_already_in_progress") this.needsTaskRefresh = true;
+        }
+        if (error === "no_sabotage_completed") {
+          this.needsTaskRefresh = true;
+          this.memory.canTriggerAlarm = false;
+        }
+        if (error === "on_cooldown") {
+          const cd = (evt as any).kill_cooldown_secs ?? (evt as any).data?.kill_cooldown_secs;
+          this.errorBusyUntil = Date.now() + (cd ? cd * 1000 : 5000);
+        }
+        if (error === "cannot_kill_teammate") {
+          this.errorBusyUntil = Date.now() + 5000;
+        }
+        if (error === "role_cannot_kill") {
+          this.memory.hasUsedOneTimeKill = true;
+        }
+        if (error === "emergency_already_active") {
+          this.memory.canTriggerAlarm = false;
+          this.lastSentAction = "";
+        }
+        if (error === "task_already_completed" && this.lastAttemptedTask) {
+          this.markTaskCompleted(this.lastAttemptedTask);
+        }
+        if (error === "task_not_assigned_to_you" && this.lastAttemptedTask) {
+          this.markTaskCompleted(this.lastAttemptedTask);
+          this.lastSentAction = "";
+        }
+        if (error === "target_unreachable_or_too_far" || error === "path_not_found"
+            || error === "invalid_position_blocked") {
+          this.errorBusyUntil = Date.now() + 3000;
+          if (this.mapRooms.length > 0) {
+            const curRoom = this.blackboard?.state?.you?.room;
+            const cands = this.mapRooms.filter(r => r.id !== curRoom);
+            if (cands.length > 0) {
+              const target = cands[Math.floor(Math.random() * cands.length)];
+              this.sendAction({ action: "move", target_x: target.x, target_y: target.y });
+              this.log.status("path_recovery", `Path blocked, wandering to ${target.id}`);
+            }
+          }
+        }
+        break;
+      }
+
+      case "role_assigned": {
         this.log.status("role_assigned",
           `Role: ${evt.role_display_name} (${evt.faction}). Goal: ${evt.role_target ?? "?"}`);
+        const tasks = (evt as any).assigned_tasks ?? [];
+        for (const t of tasks) {
+          if (t.name) this.memory.assignedTaskNames.add(t.name);
+        }
         break;
+      }
+
+      case "crab_teammates": {
+        const mates = (evt as any).teammates ?? [];
+        for (const name of mates) {
+          this.memory.teammates.add(name);
+        }
+        this.log.status("teammates", `Teammates: ${mates.join(", ")}`);
+        break;
+      }
+
+      case "player_spotted":
+        if (evt.spotted_name) {
+          this.recordPlayerSighting(
+            evt.spotted_name as string,
+            evt.spotted_x as number,
+            evt.spotted_y as number,
+            evt.spotted_room as string,
+            evt.tick as number,
+          );
+          // Also cache for merging into bb.state.players at next decide()
+          this.recentSpotted.set(evt.spotted_name as string, {
+            x: evt.spotted_x as number,
+            y: evt.spotted_y as number,
+            room: evt.spotted_room as string,
+            tick: evt.tick as number,
+          });
+        }
+        break;
+
       case "bobbit_time_start":
-        this.log.status("bobbit_time", "Bobbit Worm Time! Meetings disabled. Survive 60s to win.");
+        this.log.status("bobbit_time", "Bobbit Worm Time! Survive 60s to win.");
         break;
+
       case "win_blocked_by_bobbit":
-        this.log.status("win_blocked",
-          `${evt.blocked_winner} win blocked by Bobbit Worm (${evt.reason}).`);
+        this.log.status("win_blocked", `${evt.blocked_winner} win blocked by Bobbit Worm.`);
         break;
     }
   }
@@ -355,8 +590,12 @@ class Bot {
   private syncPhase(phase: string) {
     if (phase === "meeting" && !this.meetingActive) {
       this.meetingActive = true;
-      this.log.status("meeting_started",
-        "Meeting in progress. Bot paused. Handle speech/vote via HTTP API.");
+      this.memory.socializing = null;
+      this.memory.stalking = null;
+      this.memory.hunting = null;
+      this.memory.loitering = null;
+      this.errorBusyUntil = 0;
+      this.log.status("meeting_started", "Meeting in progress. Handle speech/vote via HTTP.");
     } else if (phase === "wandering" && this.meetingActive) {
       this.meetingActive = false;
       this.log.status("meeting_ended", "Meeting ended. Bot resuming.");
@@ -367,36 +606,230 @@ class Bot {
     }
   }
 
-  private scheduleDecision() {
-    setTimeout(() => this.decide(), DECISION_INTERVAL_MS);
+  // ─── Decision loop ─────────────────────────────────────────────────────────
+
+  private scheduleDecision(delayMs: number) {
+    setTimeout(() => this.decide(), Math.max(delayMs, MIN_POLL_INTERVAL_MS));
   }
 
-  private decide() {
-    if (this.gameOver || this.meetingActive || !this.state) {
-      this.scheduleDecision();
-      return;
+  private async decide() {
+    try {
+      if (this.gameOver) return;
+
+      // Debounce: don't poll too soon after sending an action
+      const sinceLast = Date.now() - this.lastActionTs;
+      if (this.lastActionTs > 0 && sinceLast < POST_ACTION_DEBOUNCE_MS) {
+        this.scheduleDecision(POST_ACTION_DEBOUNCE_MS - sinceLast);
+        return;
+      }
+
+      // Poll fresh state from server
+      const json = await this.httpGet("/api/v1/game/current");
+      if (!json?.success || !json.data) {
+        this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
+        return;
+      }
+
+      const data = json.data;
+      const tick: number = data.tick ?? 0;
+
+      // Sync phase
+      this.syncPhase(data.phase);
+      if (this.meetingActive || this.gameOver) {
+        // Reset stuck timer during meeting so position freeze doesn't count
+        this.lastPosMoveTs = Date.now();
+        this.lastKnownPos = null;
+        this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
+        return;
+      }
+
+      // Detect new tasks from /game/current response
+      if (Array.isArray(data.your_tasks)) {
+        this.mergeNewTasks(data.your_tasks);
+      }
+
+      // Update memory (players, corpses, events)
+      this.updateMemory(data, tick);
+
+      const you = data.you;
+
+      // Track current room for sabotage room detection
+      if (you?.room) this.lastRoom = you.room;
+
+      // If dead, stop
+      if (!you?.is_alive) {
+        this.scheduleDecision(IDLE_POLL_INTERVAL_MS * 3);
+        return;
+      }
+
+      // If busy (moving or doing task), wait for remaining_secs
+      if (you.currently_moving || you.doing_task) {
+        const waitMs = Math.max((you.remaining_secs ?? 1) * 1000, MIN_POLL_INTERVAL_MS);
+        this.scheduleDecision(waitMs);
+        return;
+      }
+
+      // Fallback busy check: WebSocket action_result says we're still busy
+      // (covers cases where HTTP poll returns stale doing_task: false)
+      if (Date.now() < this.errorBusyUntil) {
+        const waitMs = Math.max(this.errorBusyUntil - Date.now(), MIN_POLL_INTERVAL_MS);
+        this.scheduleDecision(waitMs);
+        return;
+      }
+
+      // Anti-stuck: if not moving and position unchanged for STUCK_TIMEOUT_MS, force wander
+      if (!you.currently_moving) {
+        const pos = { x: you.x, y: you.y };
+        if (!this.lastKnownPos
+          || this.lastKnownPos.x !== pos.x
+          || this.lastKnownPos.y !== pos.y) {
+          this.lastKnownPos = pos;
+          this.lastPosMoveTs = Date.now();
+        } else if (Date.now() - this.lastPosMoveTs > STUCK_TIMEOUT_MS) {
+          const cands = this.mapRooms.filter(r => r.id !== you.room);
+          if (cands.length > 0) {
+            const t = cands[Math.floor(Math.random() * cands.length)];
+            this.sendAction({ action: "move", target_x: t.x, target_y: t.y });
+            this.log.status("anti_stuck", `Stuck for ${STUCK_TIMEOUT_MS / 1000}s, forcing wander to ${t.id}`);
+          }
+          this.lastPosMoveTs = Date.now();
+          this.scheduleDecision(POST_ACTION_DEBOUNCE_MS);
+          return;
+        }
+      }
+
+      // Refresh tasks if none cached
+      await this.maybeRefreshTasks();
+
+      // Sync tasks from server when refresh is needed (e.g. after task_already_in_progress errors)
+      if (this.needsTaskRefresh && Date.now() - this.lastTaskRefreshTs >= TASK_REFRESH_INTERVAL_MS) {
+        await this.fetchMapInfo();
+        this.needsTaskRefresh = false;
+      }
+
+      // If emergency active, ensure we have its coordinates by refreshing map
+      if (data.emergency?.task_name) {
+        const emergencyTaskName = (data.emergency as any).task_name as string;
+        const hasEmergencyTask = this.cachedTasks.some(
+          t => t.name === emergencyTaskName
+        );
+        if (!hasEmergencyTask) {
+          await this.fetchMapInfo();
+        }
+      }
+
+      // Build game state for behavior tree
+      // Merge HTTP visible_players with recently spotted players (from WebSocket player_spotted events).
+      // player_spotted events fire during movement but decide() only runs when idle, so without this
+      // merge bb.state.players would be empty whenever visible_players is empty on the poll.
+      const RECENT_SPOTTED_TTL_TICKS = 10;
+      const pollPlayers: { name: string; x: number; y: number; room: string; fromSpotted?: boolean }[] =
+        data.players ?? data.visible_players ?? [];
+      const pollPlayerNames = new Set(pollPlayers.map((p: any) => p.name));
+      // Evict stale entries and merge non-duplicate spotted players
+      for (const [name, entry] of this.recentSpotted) {
+        if (tick - entry.tick > RECENT_SPOTTED_TTL_TICKS) {
+          this.recentSpotted.delete(name);
+        } else if (!pollPlayerNames.has(name) && name !== (data.you?.name ?? "")) {
+          pollPlayers.push({ name, x: entry.x, y: entry.y, room: entry.room, fromSpotted: true });
+        }
+      }
+      const gameState: GameState = {
+        phase: data.phase,
+        you,
+        your_tasks: this.getActiveTasks(),
+        players: pollPlayers,
+        corpses: data.corpses ?? data.nearby_corpses ?? [],
+        emergency: data.emergency,
+        task_progress: data.task_progress,
+      };
+
+      // Enrich emergency with coordinates from cached tasks
+      if ((gameState.emergency as any)?.task_name) {
+        const emergencyName = (gameState.emergency as any).task_name as string;
+        const et = this.cachedTasks.find(t => t.name === emergencyName);
+        if (et) {
+          (gameState.emergency as any).name = et.name;
+          (gameState.emergency as any).x = et.x;
+          (gameState.emergency as any).y = et.y;
+          (gameState.emergency as any).room = et.room;
+        }
+      }
+
+      // Lazy-init behavior tree
+      if (!this.tree) {
+        this.tree = createTree(you.faction, you.role);
+        this.log.status("tree_created", `Behavior tree: ${you.role} (${you.faction})`);
+      }
+
+      // Update blackboard
+      if (!this.blackboard) {
+        this.blackboard = createBlackboard(gameState, this.mapRooms);
+      }
+      this.blackboard.state = gameState;
+      this.blackboard.pendingAction = null;
+      this.blackboard.mapRooms = this.mapRooms;
+      this.blackboard.memory = this.memory;
+      this.blackboard.currentTick = tick;
+      this.blackboard.allTaskLocations = this.allTaskLocations;
+
+      // Tick behavior tree
+      this.tree.tick(this.blackboard);
+
+      // Send decided action
+      if (this.blackboard.pendingAction) {
+        this.sendAction(this.blackboard.pendingAction);
+        // After sending, wait debounce then re-poll to see new state
+        this.scheduleDecision(POST_ACTION_DEBOUNCE_MS);
+      } else {
+        this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
+      }
+
+      // Detect socializing state changes and emit log events for LLM speech generation
+      const currentSocialTarget = this.memory.socializing?.targetPlayer ?? null;
+      if (currentSocialTarget !== this.lastSocialTarget) {
+        if (currentSocialTarget) {
+          // Entered socializing state
+          this.log.status("social_start", JSON.stringify({
+            target: currentSocialTarget,
+            you: { name: you.name, role: you.role, faction: you.faction },
+            task_progress: gameState.task_progress ?? null,
+            alive_players: gameState.players.length + 1,
+          }));
+        } else {
+          // Left socializing state
+          this.log.status("social_end", JSON.stringify({ target: this.lastSocialTarget }));
+        }
+        this.lastSocialTarget = currentSocialTarget;
+      }
+    } catch (err: any) {
+      this.log.error(`decide error: ${err.message ?? err}`);
+      this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
     }
-
-    const { you } = this.state;
-    if (!you?.is_alive || you.currently_moving || you.doing_task) {
-      this.scheduleDecision();
-      return;
-    }
-
-    let action: object;
-    if (you.faction === "lobster")       action = decideLobster(this.state);
-    else if (you.faction === "crab")     action = decideCrab(this.state);
-    else                                 action = decideNeutral(this.state);
-
-    this.sendAction(action);
-    this.scheduleDecision();
   }
 
   private sendAction(action: object) {
     if (this.ws.readyState !== WebSocket.OPEN) return;
-    const actionName = (action as { action: string }).action;
+
+    // Dedup: skip if same action sent within 10s
+    const actionStr = JSON.stringify(action);
+    if (actionStr === this.lastSentAction && Date.now() - this.lastSentTs < 10000) {
+      // Same action repeated — likely stale state, request task refresh
+      this.needsTaskRefresh = true;
+      return;
+    }
+
+    const a = action as { action: string; task_name?: string };
+
+    if (a.action === "task" && a.task_name) {
+      this.lastAttemptedTask = a.task_name;
+    }
+
     this.ws.send(JSON.stringify({ type: "action", data: action }));
-    this.log.action(actionName, action);
+    this.log.action(a.action, action);
+    this.lastActionTs = Date.now();
+    this.lastSentAction = actionStr;
+    this.lastSentTs = Date.now();
   }
 }
 
