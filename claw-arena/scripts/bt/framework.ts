@@ -84,6 +84,8 @@ export interface Memory {
 export interface Blackboard {
   state: GameState;
   pendingAction: object | null;
+  /** Reasoning or intent to attach as thinking_content on the next action. */
+  thinkingContent: string | null;
   mapRooms: RoomCenter[];
   memory: Memory;
   currentTick: number;
@@ -95,6 +97,7 @@ export function createBlackboard(state: GameState, mapRooms: RoomCenter[] = []):
   return {
     state,
     pendingAction: null,
+    thinkingContent: null,
     mapRooms,
     memory: {
       playerSightings: new Map(),
@@ -163,6 +166,12 @@ export function nearest<T extends { x: number; y: number }>(from: { x: number; y
   return items.reduce((a, b) =>
     dist(from.x, from.y, a.x, a.y) <= dist(from.x, from.y, b.x, b.y) ? a : b
   );
+}
+
+/** Map room id to display name. Handles the one English outlier. */
+function roomName(room: string | null | undefined): string {
+  if (!room) return "未知区域";
+  return room === "hallway" ? "走廊" : room;
 }
 
 // ─── Condition Nodes ─────────────────────────────────────────────────────────
@@ -327,6 +336,7 @@ export class MoveToEmergency extends BtNode {
     const e = bb.state.emergency;
     if (!e || e.x == null || e.y == null) return NodeStatus.FAILURE;
     bb.pendingAction = { action: "move", target_x: e.x, target_y: e.y };
+    bb.thinkingContent = `紧急任务！前往 ${roomName(e.room)} 处理 ${(e as any).task_name ?? e.name ?? "emergency"}，剩余 ${Math.round(e.remaining_secs)}s`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -338,12 +348,18 @@ export class DoEmergencyTask extends BtNode {
     const taskName = e.name ?? (e as any).task_name;
     if (!taskName) return NodeStatus.FAILURE;
     bb.pendingAction = { action: "task", task_name: taskName };
+    bb.thinkingContent = `执行紧急任务 ${taskName}，剩余 ${Math.round(e.remaining_secs)}s，必须完成`;
     return NodeStatus.SUCCESS;
   }
 }
 
 export class Report extends BtNode {
-  tick(bb: Blackboard) { bb.pendingAction = { action: "report" }; return NodeStatus.SUCCESS; }
+  tick(bb: Blackboard) {
+    const corpse = nearest(bb.state.you, bb.state.corpses);
+    bb.pendingAction = { action: "report" };
+    bb.thinkingContent = `发现尸体${corpse ? `（${corpse.name} 在 ${roomName(corpse.room)}）` : ""}，报告召开会议`;
+    return NodeStatus.SUCCESS;
+  }
 }
 
 export class MoveToNearestTask extends BtNode {
@@ -360,6 +376,7 @@ export class DoNearestTask extends BtNode {
     const t = nearest(bb.state.you, bb.state.your_tasks);
     if (!t) return NodeStatus.FAILURE;
     bb.pendingAction = { action: "task", task_name: t.name };
+    bb.thinkingContent = `执行任务 ${t.name}`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -374,7 +391,10 @@ export class KillNearbyEnemy extends BtNode {
       && dist(you.x, you.y, p.x, p.y) <= 100
     );
     if (!t) return NodeStatus.FAILURE;
+    const enemies = players.filter(p => p.name !== you.name && !bb.memory.teammates.has(p.name));
+    const reason = enemies.length >= 4 ? "混战局面趁乱" : "单独在场，安全击杀";
     bb.pendingAction = { action: "kill", target: t.name };
+    bb.thinkingContent = `${reason}，击杀 ${t.name}（距离 ${dist(you.x, you.y, t.x, t.y).toFixed(0)}u）`;
     bb.memory.lastKillTick = bb.currentTick;
     return NodeStatus.SUCCESS;
   }
@@ -411,6 +431,7 @@ export class CanTriggerAlarm extends BtNode {
 export class TriggerAlarm extends BtNode {
   tick(bb: Blackboard) {
     bb.pendingAction = { action: "trigger_alarm" };
+    bb.thinkingContent = `触发紧急警报！破坏任务已完成，现在激活倒计时给龙虾施压`;
     bb.memory.canTriggerAlarm = false;
     bb.memory.lastAlarmTick = bb.currentTick;
     return NodeStatus.SUCCESS;
@@ -424,12 +445,17 @@ export class ChaseNearestPlayer extends BtNode {
     const t = nearest(you, players.filter(p => p.name !== you.name));
     if (!t) return NodeStatus.FAILURE;
     bb.pendingAction = { action: "move", target_x: t.x, target_y: t.y };
+    bb.thinkingContent = `追踪玩家 ${t.name}（${roomName(t.room)}）`;
     return NodeStatus.SUCCESS;
   }
 }
 
 export class Skip extends BtNode {
-  tick(bb: Blackboard) { bb.pendingAction = { action: "skip" }; return NodeStatus.SUCCESS; }
+  tick(bb: Blackboard) {
+    bb.pendingAction = { action: "skip" };
+    bb.thinkingContent = "等待，无可执行操作";
+    return NodeStatus.SUCCESS;
+  }
 }
 
 /** Wander near the nearest corpse (stay within 30~80 units). */
@@ -445,6 +471,7 @@ export class WanderNearCorpse extends BtNode {
       target_x: c.x + Math.cos(angle) * radius,
       target_y: c.y + Math.sin(angle) * radius,
     };
+    bb.thinkingContent = `在尸体 ${c.name} 附近徘徊（${roomName(c.room)}）`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -457,7 +484,10 @@ export class Wander extends BtNode {
   tick(bb: Blackboard): NodeStatus {
     const { you } = bb.state;
     const rooms = bb.mapRooms;
-    if (!rooms?.length) { bb.pendingAction = { action: "skip" }; return NodeStatus.SUCCESS; }
+    if (!rooms?.length) {
+      bb.pendingAction = { action: "skip" };
+      return NodeStatus.SUCCESS;
+    }
 
     // Track room transitions: when bot enters a new room, record the previous room as lastRoomId
     if (this.currentRoomId !== null && this.currentRoomId !== you.room) {
@@ -499,6 +529,7 @@ export class StartSocialization extends BtNode {
       target_x: target.x,
       target_y: target.y,
     };
+    bb.thinkingContent = `开始接触 ${target.name}（${roomName(target.room)}），建立存在感`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -547,6 +578,7 @@ export class KillPlayerNearCorpse extends BtNode {
     );
     if (!target) return NodeStatus.FAILURE;
     bb.pendingAction = { action: "kill", target: target.name };
+    bb.thinkingContent = `现行抓获：${target.name} 在尸体 ${corpse.name} 旁边（${roomName(corpse.room)}），击杀`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -589,6 +621,7 @@ export class KillIdlePlayer extends BtNode {
     }
     if (!best) return NodeStatus.FAILURE;
     bb.pendingAction = { action: "kill", target: best.name };
+    bb.thinkingContent = `击杀长期游荡的可疑玩家 ${best.name}（idle=${bestIdle}）`;
     bb.memory.stalking = null;
     return NodeStatus.SUCCESS;
   }
@@ -648,6 +681,7 @@ export class StartStalking extends BtNode {
       target_x: best.x + Math.cos(angle) * 50,
       target_y: best.y + Math.sin(angle) * 50,
     };
+    bb.thinkingContent = `开始跟踪可疑玩家 ${best.name}（idle=${bestIdle}），观察后择机击杀`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -684,11 +718,20 @@ export class FleeFromKillSite extends BtNode {
   tick(bb: Blackboard): NodeStatus {
     const { you } = bb.state;
     const rooms = bb.mapRooms;
-    if (!rooms?.length) { bb.pendingAction = { action: "skip" }; return NodeStatus.SUCCESS; }
+    if (!rooms?.length) {
+      bb.pendingAction = { action: "skip" };
+      bb.thinkingContent = "刚刚完成击杀，无路可逃，原地等待";
+      return NodeStatus.SUCCESS;
+    }
     const cands = rooms.filter(r => r.id !== you.room);
-    if (!cands.length) { bb.pendingAction = { action: "skip" }; return NodeStatus.SUCCESS; }
+    if (!cands.length) {
+      bb.pendingAction = { action: "skip" };
+      bb.thinkingContent = "刚刚完成击杀，无其他房间可逃";
+      return NodeStatus.SUCCESS;
+    }
     const t = cands[Math.floor(Math.random() * cands.length)];
     bb.pendingAction = { action: "move", target_x: t.x, target_y: t.y };
+    bb.thinkingContent = `刚击杀完毕，迅速撤离到 ${roomName(t.id)} 制造不在场证明`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -742,6 +785,7 @@ export class StartHunting extends BtNode {
       target_x: target.x,
       target_y: target.y,
     };
+    bb.thinkingContent = `锁定猎物 ${target.name}（${roomName(target.room)}），CD 好了立刻击杀`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -772,6 +816,7 @@ export class KillHuntTarget extends BtNode {
     );
     if (!target) { bb.memory.hunting = null; return NodeStatus.FAILURE; }
     bb.pendingAction = { action: "kill", target: target.name };
+    bb.thinkingContent = `CD 已就绪，击杀猎物 ${target.name}`;
     bb.memory.hunting = null;
     bb.memory.lastKillTick = bb.currentTick;
     return NodeStatus.SUCCESS;
@@ -840,6 +885,7 @@ export class StartLoitering extends BtNode {
       target_x: c.x + Math.cos(angle) * radius,
       target_y: c.y + Math.sin(angle) * radius,
     };
+    bb.thinkingContent = `开始在尸体 ${c.name} 旁徘徊，制造嫌疑，等待有人看见我`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -868,14 +914,23 @@ export class FleeFromCorpse extends BtNode {
     bb.memory.loitering = null;
     const { you } = bb.state;
     const rooms = bb.mapRooms;
-    if (!rooms?.length) { bb.pendingAction = { action: "skip" }; return NodeStatus.SUCCESS; }
+    if (!rooms?.length) {
+      bb.pendingAction = { action: "skip" };
+      bb.thinkingContent = "有人来了！想逃但没有路";
+      return NodeStatus.SUCCESS;
+    }
     const sorted = rooms
       .filter(r => r.id !== you.room)
       .sort((a, b) => dist(you.x, you.y, a.x, a.y) - dist(you.x, you.y, b.x, b.y));
-    if (!sorted.length) { bb.pendingAction = { action: "skip" }; return NodeStatus.SUCCESS; }
+    if (!sorted.length) {
+      bb.pendingAction = { action: "skip" };
+      bb.thinkingContent = "有人来了！无处可逃";
+      return NodeStatus.SUCCESS;
+    }
     const topN = sorted.slice(0, Math.min(3, sorted.length));
     const t = topN[Math.floor(Math.random() * topN.length)];
     bb.pendingAction = { action: "move", target_x: t.x, target_y: t.y };
+    bb.thinkingContent = `有目击者出现！迅速从尸体旁逃往 ${roomName(t.id)}，制造逃跑嫌疑`;
     return NodeStatus.SUCCESS;
   }
 }
@@ -902,6 +957,7 @@ export class ParadiseFishSocialize extends BtNode {
       target_x: target.x + Math.cos(angle) * 50,
       target_y: target.y + Math.sin(angle) * 50,
     };
+    bb.thinkingContent = `接近 ${target.name}，制造可疑互动，增加被投票出局的机会`;
     return NodeStatus.SUCCESS;
   }
 }

@@ -141,6 +141,7 @@ class Bot {
   /** Dedup: JSON of last sent action + timestamp to avoid spamming the same action. */
   private lastSentAction = "";
   private lastSentTs = 0;
+  private lastThinkingTs = 0;
   /** When true, next decide() will call fetchMapInfo() to sync tasks from server. */
   private needsTaskRefresh = false;
   /** Last known room of this bot (for sabotageRoom tracking). */
@@ -781,6 +782,7 @@ class Bot {
       }
       this.blackboard.state = gameState;
       this.blackboard.pendingAction = null;
+      this.blackboard.thinkingContent = null;
       this.blackboard.mapRooms = this.mapRooms;
       this.blackboard.memory = this.memory;
       this.blackboard.currentTick = tick;
@@ -788,6 +790,16 @@ class Bot {
 
       // Tick behavior tree
       this.tree.tick(this.blackboard);
+
+      // Attach thinking_content from blackboard to the pending action (if any)
+      if (this.blackboard.pendingAction && this.blackboard.thinkingContent) {
+        const now = Date.now();
+        if (now - this.lastThinkingTs >= 10000) {
+          (this.blackboard.pendingAction as any).thinking_content = this.blackboard.thinkingContent;
+          this.lastThinkingTs = now;
+        }
+      }
+      this.blackboard.thinkingContent = null;
 
       // Send decided action
       if (this.blackboard.pendingAction) {
