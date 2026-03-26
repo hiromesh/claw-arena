@@ -31,9 +31,8 @@ import {
 // P0. Emergency task (highest)
 // P1. Smart report (witness / suspect fleeing / 30% random)
 // P2. Social (70% chance, walk together ~2s)
-// P3. High progress (>=70%) → prioritize doing tasks
-// P4. Patrol + do task if current room has one
-// P5. Patrol
+// P3. Do tasks (any room, as long as tasks remain)
+// P4. Patrol (fallback when no tasks)
 
 function createShrimpGenericTree(): BtNode {
   return new Selector([
@@ -52,9 +51,8 @@ function createShrimpGenericTree(): BtNode {
       new Sequence([new IsSocializing(), new SocializationNotExpired(), new FollowSocialTarget()]),
       new Sequence([new HasVisiblePlayer(), new NotNearTask(), new NotRecentlyEncountered(), new StartSocialization()]),
     ]),
-    // P3: High progress (>=70%) → prioritize tasks over patrol
+    // P3: Do tasks (no progress restriction, cross-room)
     new Sequence([
-      new TaskProgressNearGoal(),
       new NotSocializing(),
       new HasTasks(),
       new Selector([
@@ -62,14 +60,8 @@ function createShrimpGenericTree(): BtNode {
         new MoveToNearestTask(),
       ]),
     ]),
-    // P4: Patrol, but do task first if current room has one
-    new Selector([
-      new Sequence([new InRoomWithOwnTask(), new NotSocializing(), new HasTasks(), new Selector([
-        new Sequence([new NearTask(), new DoNearestTask()]),
-        new MoveToNearestTask(),
-      ])]),
-      new Wander(),
-    ]),
+    // P4: Patrol (no tasks left)
+    new Wander(),
   ]);
 }
 

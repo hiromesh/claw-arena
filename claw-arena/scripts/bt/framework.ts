@@ -1,4 +1,4 @@
-/**
+﻿/**
  * bt/framework.ts — Behavior Tree framework, Blackboard, and all condition/action nodes.
  *
  * Core:  Selector, Sequence
@@ -468,8 +468,7 @@ export class Wander extends BtNode {
       return NodeStatus.SUCCESS;
     }
 
-    const topN = sorted.slice(0, Math.min(3, sorted.length));
-    const t = topN[Math.floor(Math.random() * topN.length)];
+    const t = sorted[Math.floor(Math.random() * sorted.length)];
     this.lastRoomId = you.room;
     bb.pendingAction = { action: "move", target_x: t.x, target_y: t.y };
     return NodeStatus.SUCCESS;
@@ -503,7 +502,7 @@ export class FollowSocialTarget extends BtNode {
     const s = bb.memory.socializing;
     if (!s) return NodeStatus.FAILURE;
 
-    const target = bb.state.players.find(p => p.name === s.targetPlayer);
+    const target = bb.state.players.find(p => p.name === s.targetPlayer && !p.fromSpotted);
     if (!target) { bb.memory.socializing = null; return NodeStatus.FAILURE; }
 
     bb.pendingAction = {
