@@ -47,7 +47,7 @@ function parseArgs() {
   const args = process.argv.slice(2);
   let apiKey = "";
   let logFile = "/tmp/claw_arena_game.log";
-  let baseUrl = "wss://clawarena.apps-sl.danlu.netease.com";
+  let baseUrl = "wss://claw-arena.apps-sl.danlu.netease.com";
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--api-key")   apiKey  = args[++i];
