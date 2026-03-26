@@ -16,9 +16,11 @@ export interface You {
   x: number;
   y: number;
   room: string;
-  currently_moving: boolean;
-  doing_task: boolean;
-  remaining_secs: number;
+  // WS 推送包含这些字段，HTTP /game/current 不返回。
+  // 服务器允许中途打断，无需据此等待。
+  currently_moving?: boolean;
+  doing_task?: boolean;
+  remaining_secs?: number;
   kill_cooldown_secs?: number;
 }
 
@@ -173,7 +175,7 @@ export class NearEmergency extends BtNode {
   tick(bb: Blackboard) {
     const { you } = bb.state; const e = bb.state.emergency;
     if (!e || e.x == null || e.y == null) return NodeStatus.FAILURE;
-    return dist(you.x, you.y, e.x, e.y) <= 50 ? NodeStatus.SUCCESS : NodeStatus.FAILURE;
+    return dist(you.x, you.y, e.x, e.y) <= 100 ? NodeStatus.SUCCESS : NodeStatus.FAILURE;
   }
 }
 
@@ -191,7 +193,7 @@ export class NearTask extends BtNode {
   tick(bb: Blackboard) {
     const { you, your_tasks } = bb.state;
     const t = nearest(you, your_tasks);
-    return t && dist(you.x, you.y, t.x, t.y) <= 50 ? NodeStatus.SUCCESS : NodeStatus.FAILURE;
+    return t && dist(you.x, you.y, t.x, t.y) <= 100 ? NodeStatus.SUCCESS : NodeStatus.FAILURE;
   }
 }
 
@@ -450,11 +452,18 @@ export class WanderNearCorpse extends BtNode {
 /** Wander to a nearby room (prefers close rooms, avoids current + last visited). */
 export class Wander extends BtNode {
   private lastRoomId: string | null = null;
+  private currentRoomId: string | null = null;
 
   tick(bb: Blackboard): NodeStatus {
     const { you } = bb.state;
     const rooms = bb.mapRooms;
     if (!rooms?.length) { bb.pendingAction = { action: "skip" }; return NodeStatus.SUCCESS; }
+
+    // Track room transitions: when bot enters a new room, record the previous room as lastRoomId
+    if (this.currentRoomId !== null && this.currentRoomId !== you.room) {
+      this.lastRoomId = this.currentRoomId;
+    }
+    this.currentRoomId = you.room;
 
     const sorted = rooms
       .filter(r => r.id !== you.room && r.id !== this.lastRoomId)
@@ -463,13 +472,11 @@ export class Wander extends BtNode {
     if (!sorted.length) {
       const fallback = rooms.filter(r => r.id !== you.room);
       const t = fallback.length ? fallback[Math.floor(Math.random() * fallback.length)] : rooms[0];
-      this.lastRoomId = you.room;
       bb.pendingAction = { action: "move", target_x: t.x, target_y: t.y };
       return NodeStatus.SUCCESS;
     }
 
     const t = sorted[Math.floor(Math.random() * sorted.length)];
-    this.lastRoomId = you.room;
     bb.pendingAction = { action: "move", target_x: t.x, target_y: t.y };
     return NodeStatus.SUCCESS;
   }
@@ -650,7 +657,7 @@ export class FollowStalkTarget extends BtNode {
   tick(bb: Blackboard): NodeStatus {
     const s = bb.memory.stalking;
     if (!s) return NodeStatus.FAILURE;
-    const target = bb.state.players.find(p => p.name === s.targetPlayer);
+    const target = bb.state.players.find(p => p.name === s.targetPlayer && !p.fromSpotted);
     if (!target) { bb.memory.stalking = null; return NodeStatus.FAILURE; }
     const angle = Math.random() * Math.PI * 2;
     bb.pendingAction = {
@@ -744,7 +751,7 @@ export class FollowHuntTarget extends BtNode {
   tick(bb: Blackboard): NodeStatus {
     const h = bb.memory.hunting;
     if (!h) return NodeStatus.FAILURE;
-    const target = bb.state.players.find(p => p.name === h.targetPlayer);
+    const target = bb.state.players.find(p => p.name === h.targetPlayer && !p.fromSpotted);
     if (!target) { bb.memory.hunting = null; return NodeStatus.FAILURE; }
     bb.pendingAction = {
       action: "move",

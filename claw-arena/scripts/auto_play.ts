@@ -9,14 +9,16 @@
  *
  * Decision loop:
  *   1. Poll GET /game/current for fresh state
- *   2. If busy (currently_moving / doing_task) → wait remaining_secs, goto 1
- *   3. Update memory from visible_players, corpses, new_events
- *   4. Tick behavior tree → get pendingAction
- *   5. Send action via WebSocket → wait debounce (500ms) → goto 1
+ *   2. Update memory from visible_players, corpses, new_events
+ *   3. Tick behavior tree → get pendingAction
+ *   4. Send action via WebSocket → wait debounce (500ms) → goto 1
  *
  * Usage:
  *   npx ts-node auto_play.ts --api-key arena_xxx --log-file game.log [--base-url wss://...]
  */
+
+// errorBusyUntil is an error backoff timer — set only for target_unreachable/path errors
+// to give path_recovery wander time to execute before the next BT decision.
 
 /// <reference types="node" />
 
@@ -37,7 +39,7 @@ const TASK_REFRESH_INTERVAL_MS = 5000;
 const POST_ACTION_DEBOUNCE_MS = 500;    // wait after sending action before next poll
 const MIN_POLL_INTERVAL_MS = 500;       // never poll faster than this
 const IDLE_POLL_INTERVAL_MS = 1000;     // poll interval when idle (no action to take)
-const STUCK_TIMEOUT_MS = 20000;         // force wander if position unchanged for this long
+const STUCK_TIMEOUT_MS = 15000;         // force wander if position unchanged for this long
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -78,6 +80,8 @@ class Logger {
   action(action: string, payload: object)      { this.write({ type: "action", action, payload }); }
   status(status: string, message: string)      { this.write({ type: "status", status, message }); }
   error(message: string)                       { this.write({ type: "error", message }); }
+  wsRaw(msg: unknown)                          { this.write({ type: "ws_raw", msg }); }
+  httpRaw(url: string, response: unknown)      { this.write({ type: "http_raw", url, response }); }
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -90,7 +94,7 @@ class Bot {
 
   // ─── Game state ───
   private gameOver = false;
-  private meetingActive = false;
+  private lastPhase = "wandering";
 
   // ─── Map & tasks ───
   private mapRooms: RoomCenter[] = [];
@@ -144,10 +148,15 @@ class Bot {
   /** Anti-stuck: last recorded position and the timestamp it was last updated. */
   private lastKnownPos: { x: number; y: number } | null = null;
   private lastPosMoveTs: number = Date.now();
+  /** True while bot is executing an anti-stuck forced move. BT tick is suppressed until move completes or times out. */
+  private antiStuckActive = false;
+  /** Timestamp when anti-stuck was last triggered (for 10s expiry). */
+  private antiStuckTs = 0;
+  private readonly ANTI_STUCK_PROTECTION_MS = 10000;
   /** Track socializing state changes to emit social_start / social_end log events. */
   private lastSocialTarget: string | null = null;
-  /** Recent player_spotted cache: name → {x, y, room, tick}. Merged into bb.state.players each decide(). */
-  private recentSpotted: Map<string, { x: number; y: number; room: string; tick: number }> = new Map();
+  /** Recent player_spotted cache: name → {x, y, room, ts}. Merged into bb.state.players each decide(). */
+  private recentSpotted: Map<string, { x: number; y: number; room: string; ts: number }> = new Map();
 
   constructor(private apiKey: string, logFile: string, baseUrl: string) {
     this.log = new Logger(logFile);
@@ -156,7 +165,7 @@ class Bot {
   }
 
   start() {
-    this.log.status("connecting", `Connecting to ${this.wsUrl}`);
+    this.log.status("net.connecting", `Connecting to ${this.wsUrl}`);
     this.connect();
   }
 
@@ -170,11 +179,21 @@ class Bot {
         let body = "";
         res.on("data", (chunk: Buffer) => body += chunk.toString());
         res.on("end", () => {
-          try { resolve(JSON.parse(body)); }
-          catch { resolve(null); }
+          try {
+            const json = JSON.parse(body);
+            this.log.httpRaw(urlPath, json);
+            resolve(json);
+          }
+          catch {
+            this.log.error(`net.http_parse_error ${urlPath}: ${body.substring(0, 200)}`);
+            resolve(null);
+          }
         });
       });
-      req.on("error", () => resolve(null));
+      req.on("error", (err: Error) => {
+        this.log.error(`net.http_request_error ${urlPath}: ${err.message}`);
+        resolve(null);
+      });
     });
   }
 
@@ -198,7 +217,7 @@ class Bot {
           }
         }
       }
-      this.log.status("map_loaded", `Loaded ${this.mapRooms.length} walkable room targets`);
+      this.log.status("init.map_loaded", `Loaded ${this.mapRooms.length} walkable room targets`);
     }
 
     // Load all task locations (for idle player detection)
@@ -226,7 +245,7 @@ class Bot {
         }
       }
       if (this.allTaskLocations.length > 0) {
-        this.log.status("task_locations_loaded", `Loaded ${this.allTaskLocations.length} task locations for idle detection`);
+        this.log.status("init.task_locations", `Loaded ${this.allTaskLocations.length} task locations for idle detection`);
       }
     }
 
@@ -246,8 +265,9 @@ class Bot {
     // Detect removed tasks (completed on server but still in cache)
     const removedTasks = this.cachedTasks.filter(t => !serverNames.has(t.name));
     for (const t of removedTasks) {
+      const wasAlreadyCompleted = this.completedTaskNames.has(t.name);
       this.completedTaskNames.add(t.name);
-      if (this.memory.assignedTaskNames.has(t.name)) {
+      if (this.memory.assignedTaskNames.has(t.name) && !wasAlreadyCompleted) {
         this.memory.canTriggerAlarm = true;
       }
     }
@@ -260,22 +280,7 @@ class Bot {
       name: t.name, x: t.x, y: t.y, room: t.room, status: t.status ?? "normal"
     }));
 
-    this.log.status("tasks_synced", `Synced: ${this.cachedTasks.length} active, ${removedTasks.length} removed`);
-  }
-
-  /** Add any new tasks from server into cachedTasks (additive only, used by /game/current). */
-  private mergeNewTasks(serverTasks: TaskInfo[]) {
-    let added = 0;
-    for (const t of serverTasks) {
-      if (t.status === "completed") continue;
-      if (!this.cachedTasks.find(ct => ct.name === t.name)) {
-        this.cachedTasks.push({ name: t.name, x: t.x, y: t.y, room: t.room, status: t.status ?? "normal" });
-        added++;
-      }
-    }
-    if (added > 0) {
-      this.log.status("tasks_refreshed", `Added ${added} new task(s), total: ${this.cachedTasks.length}`);
-    }
+    this.log.status("task.synced", `Synced: ${this.cachedTasks.length} active, ${removedTasks.length} removed`);
   }
 
   /** Mark a task as completed and remove from cache. */
@@ -320,7 +325,7 @@ class Bot {
   private recordCorpse(name: string, x: number, y: number, room: string, tick: number) {
     if (this.memory.corpseSightings.has(name)) return;
     this.memory.corpseSightings.set(name, { x: x ?? 0, y: y ?? 0, room: room ?? "unknown", tick });
-    this.log.status("corpse_discovered", `Discovered corpse of ${name} in ${room ?? "unknown"}`);
+    this.log.status("game.corpse_found", `Discovered corpse of ${name} in ${room ?? "unknown"}`);
   }
 
   /** Update memory from polled state (visible_players, corpses, new_events). */
@@ -378,7 +383,7 @@ class Bot {
     this.ws = new WebSocket(this.wsUrl);
 
     this.ws.on("open", () => {
-      this.log.status("connected", "WebSocket connected");
+      this.log.status("net.ws_connected", "WebSocket connected");
       setInterval(() => {
         if (this.ws.readyState === WebSocket.OPEN) this.ws.send("ping");
       }, HEARTBEAT_INTERVAL_MS);
@@ -390,19 +395,20 @@ class Bot {
       if (text === "pong") return;
       try {
         const msg = JSON.parse(text);
+        this.log.wsRaw(msg);
         this.onWsMessage(msg);
       } catch {
-        this.log.error(`Invalid JSON: ${text}`);
+        this.log.error(`net.ws_invalid_json: ${text}`);
       }
     });
 
     this.ws.on("close", () => {
       if (this.gameOver) return;
-      this.log.error("Disconnected, reconnecting...");
+      this.log.error("net.ws_disconnected, reconnecting...");
       setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
     });
 
-    this.ws.on("error", (err: Error) => this.log.error(`WS error: ${err.message}`));
+    this.ws.on("error", (err: Error) => this.log.error(`net.ws_error: ${err.message}`));
   }
 
   /** Handle WebSocket messages — only for events and logging. State comes from HTTP poll. */
@@ -413,14 +419,18 @@ class Bot {
       if (data?.new_events?.length) {
         const threshold = this.lastWsStateTick;
         let maxTick = threshold;
+        let skippedCount = 0;
         for (const evt of data.new_events) {
           const evtTick = (evt as any).tick ?? -1;
-          if (evtTick <= threshold) continue;
+          if (evtTick <= threshold) { skippedCount++; continue; }
           if (evtTick > maxTick) maxTick = evtTick;
           this.log.event(evt);
           this.onEvent(evt);
         }
         this.lastWsStateTick = maxTick;
+        if (skippedCount > 0) {
+          this.log.status("ws.events_dedup", `Skipped ${skippedCount} events with tick <= ${threshold}`);
+        }
       }
       return;
     }
@@ -440,19 +450,17 @@ class Bot {
     switch (evt.type) {
       case "game_over":
         this.gameOver = true;
-        this.log.status("game_over", `Winner: ${evt.winner} — ${evt.reason}`);
+        this.log.status("game.over", `Winner: ${evt.winner} — ${evt.reason}`);
         process.exit(0);
         break;
 
       case "meeting_start":
-        this.meetingActive = true;
         this.memory.socializing = null;
-        this.log.status("meeting_started", "Meeting in progress. Handle speech/vote via HTTP.");
+        this.log.status("game.meeting_start", "Meeting in progress (WS). Handle speech/vote via HTTP.");
         break;
 
       case "meeting_ended":
-        this.meetingActive = false;
-        this.log.status("meeting_ended", "Meeting ended. Bot resuming.");
+        this.log.status("game.meeting_end", "Meeting ended (WS).");
         break;
 
       case "task_completed":
@@ -491,23 +499,12 @@ class Bot {
           this.lastSentAction = "";
           this.needsTaskRefresh = true;
         }
-        // Server says we're still busy — set a fallback wait and request task refresh
-        if (error === "task_already_in_progress" || error === "doing_task"
-         || error === "currently_moving") {
-          const remaining = (evt as any).remaining_secs ?? (evt as any).data?.remaining_secs;
-          this.errorBusyUntil = Date.now() + (remaining ? remaining * 1000 : 2000);
-          if (error === "task_already_in_progress") this.needsTaskRefresh = true;
+        if (error === "task_already_in_progress") {
+          this.needsTaskRefresh = true;
         }
         if (error === "no_sabotage_completed") {
           this.needsTaskRefresh = true;
           this.memory.canTriggerAlarm = false;
-        }
-        if (error === "on_cooldown") {
-          const cd = (evt as any).kill_cooldown_secs ?? (evt as any).data?.kill_cooldown_secs;
-          this.errorBusyUntil = Date.now() + (cd ? cd * 1000 : 5000);
-        }
-        if (error === "cannot_kill_teammate") {
-          this.errorBusyUntil = Date.now() + 5000;
         }
         if (error === "role_cannot_kill") {
           this.memory.hasUsedOneTimeKill = true;
@@ -532,7 +529,7 @@ class Bot {
             if (cands.length > 0) {
               const target = cands[Math.floor(Math.random() * cands.length)];
               this.sendAction({ action: "move", target_x: target.x, target_y: target.y });
-              this.log.status("path_recovery", `Path blocked, wandering to ${target.id}`);
+              this.log.status("move.path_recovery", `Path blocked, wandering to ${target.id}`);
             }
           }
         }
@@ -540,7 +537,7 @@ class Bot {
       }
 
       case "role_assigned": {
-        this.log.status("role_assigned",
+        this.log.status("game.role_assigned",
           `Role: ${evt.role_display_name} (${evt.faction}). Goal: ${evt.role_target ?? "?"}`);
         const tasks = (evt as any).assigned_tasks ?? [];
         for (const t of tasks) {
@@ -554,7 +551,7 @@ class Bot {
         for (const name of mates) {
           this.memory.teammates.add(name);
         }
-        this.log.status("teammates", `Teammates: ${mates.join(", ")}`);
+        this.log.status("game.teammates", `Teammates: ${mates.join(", ")}`);
         break;
       }
 
@@ -572,37 +569,18 @@ class Bot {
             x: evt.spotted_x as number,
             y: evt.spotted_y as number,
             room: evt.spotted_room as string,
-            tick: evt.tick as number,
+            ts: Date.now(),
           });
         }
         break;
 
       case "bobbit_time_start":
-        this.log.status("bobbit_time", "Bobbit Worm Time! Survive 60s to win.");
+        this.log.status("game.bobbit_time", "Bobbit Worm Time! Survive 60s to win.");
         break;
 
       case "win_blocked_by_bobbit":
-        this.log.status("win_blocked", `${evt.blocked_winner} win blocked by Bobbit Worm.`);
+        this.log.status("game.win_blocked", `${evt.blocked_winner} win blocked by Bobbit Worm.`);
         break;
-    }
-  }
-
-  private syncPhase(phase: string) {
-    if (phase === "meeting" && !this.meetingActive) {
-      this.meetingActive = true;
-      this.memory.socializing = null;
-      this.memory.stalking = null;
-      this.memory.hunting = null;
-      this.memory.loitering = null;
-      this.errorBusyUntil = 0;
-      this.log.status("meeting_started", "Meeting in progress. Handle speech/vote via HTTP.");
-    } else if (phase === "wandering" && this.meetingActive) {
-      this.meetingActive = false;
-      this.log.status("meeting_ended", "Meeting ended. Bot resuming.");
-    } else if (phase === "game_over") {
-      this.gameOver = true;
-      this.log.status("game_over", "Game over.");
-      process.exit(0);
     }
   }
 
@@ -633,19 +611,38 @@ class Bot {
       const data = json.data;
       const tick: number = data.tick ?? 0;
 
-      // Sync phase
-      this.syncPhase(data.phase);
-      if (this.meetingActive || this.gameOver) {
-        // Reset stuck timer during meeting so position freeze doesn't count
+      // Phase transition detection (edge-triggered, HTTP as single source of truth)
+      const phase = data.phase;
+      if (phase === "meeting" && this.lastPhase !== "meeting") {
+        this.memory.socializing = null;
+        this.memory.stalking = null;
+        this.memory.hunting = null;
+        this.memory.loitering = null;
+        this.errorBusyUntil = 0;
+        this.log.status("game.meeting_start", "Meeting in progress (HTTP).");
+      }
+      if (phase === "wandering" && this.lastPhase === "meeting") {
+        this.log.status("game.meeting_end", "Meeting ended (HTTP).");
+      }
+      if (phase === "game_over") {
+        this.gameOver = true;
+        this.log.status("game.over", "Game over (HTTP).");
+        process.exit(0);
+      }
+      this.lastPhase = phase;
+
+      if (phase !== "wandering") {
+        // meeting / game_over → don't tick BT, reset stuck timer
+        this.antiStuckActive = false;
         this.lastPosMoveTs = Date.now();
         this.lastKnownPos = null;
         this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
         return;
       }
 
-      // Detect new tasks from /game/current response
+      // Sync tasks from /game/current response (authoritative complete list)
       if (Array.isArray(data.your_tasks)) {
-        this.mergeNewTasks(data.your_tasks);
+        this.syncTasks(data.your_tasks);
       }
 
       // Update memory (players, corpses, events)
@@ -656,29 +653,42 @@ class Bot {
       // Track current room for sabotage room detection
       if (you?.room) this.lastRoom = you.room;
 
-      // If dead, stop
+      // If dead, stop the bot
       if (!you?.is_alive) {
-        this.scheduleDecision(IDLE_POLL_INTERVAL_MS * 3);
-        return;
+        this.log.status("game.dead", "Player is dead. Exiting.");
+        process.exit(0);
       }
 
-      // If busy (moving or doing task), wait for remaining_secs
-      if (you.currently_moving || you.doing_task) {
-        const waitMs = Math.max((you.remaining_secs ?? 1) * 1000, MIN_POLL_INTERVAL_MS);
-        this.scheduleDecision(waitMs);
-        return;
-      }
+      // NOTE: currently_moving / doing_task / remaining_secs 虽然会通过 WS 推送下来
+      // （HTTP /game/current 不返回这几个字段），但服务器允许在移动或任务执行中途
+      // 发送新的 action 来打断当前操作，因此无需根据这些字段等待，直接决策即可。
 
-      // Fallback busy check: WebSocket action_result says we're still busy
-      // (covers cases where HTTP poll returns stale doing_task: false)
+      // Error backoff: give path_recovery wander time to execute before next BT tick.
+      // Only set for target_unreachable / path_not_found / invalid_position_blocked.
       if (Date.now() < this.errorBusyUntil) {
         const waitMs = Math.max(this.errorBusyUntil - Date.now(), MIN_POLL_INTERVAL_MS);
         this.scheduleDecision(waitMs);
         return;
       }
 
-      // Anti-stuck: if not moving and position unchanged for STUCK_TIMEOUT_MS, force wander
-      if (!you.currently_moving) {
+      // Anti-stuck protection: suppress BT tick until forced move completes or 10s timeout
+      if (this.antiStuckActive) {
+        const timedOut = Date.now() - this.antiStuckTs > this.ANTI_STUCK_PROTECTION_MS;
+        if (!timedOut) {
+          // Still waiting for anti-stuck move — keep waiting
+          this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
+          return;
+        } else {
+          // 10s timeout — lift the lock and resume BT
+          this.antiStuckActive = false;
+          this.lastPosMoveTs = Date.now();
+          this.lastKnownPos = { x: you.x, y: you.y };
+          this.log.status("move.stuck_resolved", `Anti-stuck ended (timed out), resuming BT`);
+        }
+      }
+
+      // Anti-stuck: if position unchanged for STUCK_TIMEOUT_MS, force wander
+      {
         const pos = { x: you.x, y: you.y };
         if (!this.lastKnownPos
           || this.lastKnownPos.x !== pos.x
@@ -689,8 +699,11 @@ class Bot {
           const cands = this.mapRooms.filter(r => r.id !== you.room);
           if (cands.length > 0) {
             const t = cands[Math.floor(Math.random() * cands.length)];
+            this.lastSentAction = ""; // bypass dedup so anti-stuck move always fires
             this.sendAction({ action: "move", target_x: t.x, target_y: t.y });
-            this.log.status("anti_stuck", `Stuck for ${STUCK_TIMEOUT_MS / 1000}s, forcing wander to ${t.id}`);
+            this.log.status("move.stuck", `Stuck for ${STUCK_TIMEOUT_MS / 1000}s, forcing wander to ${t.id}`);
+            this.antiStuckActive = true;
+            this.antiStuckTs = Date.now();
           }
           this.lastPosMoveTs = Date.now();
           this.scheduleDecision(POST_ACTION_DEBOUNCE_MS);
@@ -722,13 +735,13 @@ class Bot {
       // Merge HTTP visible_players with recently spotted players (from WebSocket player_spotted events).
       // player_spotted events fire during movement but decide() only runs when idle, so without this
       // merge bb.state.players would be empty whenever visible_players is empty on the poll.
-      const RECENT_SPOTTED_TTL_TICKS = 10;
+      const RECENT_SPOTTED_TTL_MS = 8000;
       const pollPlayers: { name: string; x: number; y: number; room: string; fromSpotted?: boolean }[] =
         data.players ?? data.visible_players ?? [];
       const pollPlayerNames = new Set(pollPlayers.map((p: any) => p.name));
       // Evict stale entries and merge non-duplicate spotted players
       for (const [name, entry] of this.recentSpotted) {
-        if (tick - entry.tick > RECENT_SPOTTED_TTL_TICKS) {
+        if (Date.now() - entry.ts > RECENT_SPOTTED_TTL_MS) {
           this.recentSpotted.delete(name);
         } else if (!pollPlayerNames.has(name) && name !== (data.you?.name ?? "")) {
           pollPlayers.push({ name, x: entry.x, y: entry.y, room: entry.room, fromSpotted: true });
@@ -759,7 +772,7 @@ class Bot {
       // Lazy-init behavior tree
       if (!this.tree) {
         this.tree = createTree(you.faction, you.role);
-        this.log.status("tree_created", `Behavior tree: ${you.role} (${you.faction})`);
+        this.log.status("init.tree_created", `Behavior tree: ${you.role} (${you.faction})`);
       }
 
       // Update blackboard
@@ -782,6 +795,7 @@ class Bot {
         // After sending, wait debounce then re-poll to see new state
         this.scheduleDecision(POST_ACTION_DEBOUNCE_MS);
       } else {
+        this.log.status("bt.idle", `tick=${tick} No action decided`);
         this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
       }
 
@@ -790,7 +804,7 @@ class Bot {
       if (currentSocialTarget !== this.lastSocialTarget) {
         if (currentSocialTarget) {
           // Entered socializing state
-          this.log.status("social_start", JSON.stringify({
+          this.log.status("bt.social_start", JSON.stringify({
             target: currentSocialTarget,
             you: { name: you.name, role: you.role, faction: you.faction },
             task_progress: gameState.task_progress ?? null,
@@ -798,12 +812,12 @@ class Bot {
           }));
         } else {
           // Left socializing state
-          this.log.status("social_end", JSON.stringify({ target: this.lastSocialTarget }));
+          this.log.status("bt.social_end", JSON.stringify({ target: this.lastSocialTarget }));
         }
         this.lastSocialTarget = currentSocialTarget;
       }
     } catch (err: any) {
-      this.log.error(`decide error: ${err.message ?? err}`);
+      this.log.error(`bt.decide_error: ${err.message ?? err}`);
       this.scheduleDecision(IDLE_POLL_INTERVAL_MS);
     }
   }
@@ -815,6 +829,7 @@ class Bot {
     const actionStr = JSON.stringify(action);
     if (actionStr === this.lastSentAction && Date.now() - this.lastSentTs < 10000) {
       // Same action repeated — likely stale state, request task refresh
+      this.log.status("bt.action_dedup", `Skipped duplicate action: ${actionStr.substring(0, 100)}`);
       this.needsTaskRefresh = true;
       return;
     }
